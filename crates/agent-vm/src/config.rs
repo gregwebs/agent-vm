@@ -3,8 +3,10 @@
 //!
 //! A **tool declaration** (`[[tools]]` in a config file) is *data*: a guest
 //! command, its default argv, the credential providers it needs, extra
-//! guest-HOME-relative paths to persist, guest env pairs, and network requests.
-//! Requests never grant network access. This module
+//! guest-HOME-relative paths to persist, guest env pairs, network requests, and
+//! the **pane agent hint** a host multiplexer labels the launch with. Requests
+//! never grant network access, and the hint is host-only metadata: it never
+//! reaches the guest. This module
 //! never executes a command, creates guest state, builds an image, or captures
 //! a credential. A top-level `image` key selects the **boot image**
 //! independently of the tools (see [`crate::boot_image`]).
@@ -744,7 +746,10 @@ impl CatalogEntry {
     /// verb a non-source file supplies, or the shipped fallback. Route, never
     /// name: a uniquely named sourced `shell` is reachable only as
     /// `<alias>:shell` and does not take the affordance over.
-    fn is_shell_affordance(&self) -> bool {
+    ///
+    /// `pub(crate)` for the launcher's pane-hint decision: a bare `shell` declares
+    /// a shell, not an agent, so a hint on it is report-only (A5).
+    pub(crate) fn is_shell_affordance(&self) -> bool {
         self.bare_label.as_deref() == Some(SHELL_TOOL_NAME)
             && !matches!(self.tool.origin(), ToolOrigin::Source { .. })
     }
@@ -1314,6 +1319,11 @@ pub(crate) struct Tool {
     env: BTreeMap<String, String>,
     /// Declaration only: never authority and not folded over provisioning.
     network_requests: NetworkRequests,
+    /// The agent kind the host's terminal multiplexer should label this
+    /// launch's pane with ([`PaneAgentHint`]). Host-only: it labels the
+    /// launcher's view of a launch and never enters the guest environment, and
+    /// it is not folded over provisioning like `env`.
+    herdr_agent: Option<PaneAgentHint>,
     /// This definition's **own** mount selection, already parsed, normalized,
     /// set-expanded and deduplicated by [`crate::config_mounts`] (#396).
     ///
@@ -1427,6 +1437,13 @@ impl Tool {
         &self.network_requests
     }
 
+    /// This definition's own pane agent hint, if it declares one. Sibling
+    /// consumers ([`crate::doctor`], the launcher's re-exec) read it here rather
+    /// than from a folded closure: the hint labels **this** tool's launch only.
+    pub(crate) fn herdr_agent(&self) -> Option<&PaneAgentHint> {
+        self.herdr_agent.as_ref()
+    }
+
     /// This definition's own mount declarations, a **selection source** for a
     /// launch of this tool (never for another tool's launch). Empty for a project
     /// or built-in definition, which cannot declare one, and for the built-in
@@ -1452,6 +1469,7 @@ impl Tool {
             && self.interactive_shell == other.interactive_shell
             && self.env == other.env
             && self.network_requests == other.network_requests
+            && self.herdr_agent == other.herdr_agent
             && self.mounts.same_declarations(&other.mounts)
     }
 
@@ -1491,6 +1509,11 @@ impl Tool {
         // difference never warns — presence is an authority fact, not access.
         if !self.mounts.same_declarations(&other.mounts) {
             fields.push(ToolField::Mounts);
+        }
+        // Appended after `mounts` for the same reason as every field above: the
+        // existing differing-field sequences keep their order.
+        if self.herdr_agent != other.herdr_agent {
+            fields.push(ToolField::HerdrAgent);
         }
         fields
     }
@@ -1789,6 +1812,32 @@ impl PersistPath {
     }
 }
 
+/// The agent kind a **tool** declares so a host terminal multiplexer (herdr)
+/// recognizes the guest agent behind the **launcher**.
+///
+/// Host-only: it labels the host's view of a launch and never reaches the guest
+/// environment. There is deliberately no allowlist of built-in labels — a new
+/// agent must not need a launcher release — so the grammar is the whole rule,
+/// and it is machine-checked ([`pane_hint_token_bytes`], ADR-0018).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PaneAgentHint(String);
+
+impl PaneAgentHint {
+    /// The only constructor: no trimming, case folding or normalization, so the
+    /// declared spelling is the label.
+    fn parse(raw: String) -> Result<Self, &'static str> {
+        if pane_hint_token_bytes(raw.as_bytes()) {
+            Ok(Self(raw))
+        } else {
+            Err("herdr_agent must match [a-z0-9-]+")
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A configurable tool field, used to name the fields a cross-tier shadow
 /// differs in. `as_str` is the canonical spelling in warnings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1805,6 +1854,8 @@ pub(crate) enum ToolField {
     NetworkRequests,
     /// Appended last, like the three before it.
     Mounts,
+    /// Appended last, like every field before it.
+    HerdrAgent,
 }
 
 impl ToolField {
@@ -1819,6 +1870,7 @@ impl ToolField {
             ToolField::Env => "env",
             ToolField::NetworkRequests => "network_requests",
             ToolField::Mounts => "mounts",
+            ToolField::HerdrAgent => "herdr_agent",
         }
     }
 }
@@ -5308,6 +5360,11 @@ struct RawTool {
     env: BTreeMap<String, String>,
     #[serde(default)]
     network_requests: Vec<String>,
+    /// The pane agent hint (`[a-z0-9-]+`), host-only. A `String` here so a
+    /// rejected token is diagnosed by [`validate_tools`] with the tool and the
+    /// field named; a wrong type stays on the generic redacted serde path.
+    #[serde(default)]
+    herdr_agent: Option<String>,
     /// This definition's own mount selection (#396), user tier only.
     ///
     /// A `toml::Value`, not `Vec<String>`, for exactly the reason the top-level
@@ -5357,6 +5414,13 @@ fn validate_tools(
         let env = validate_env(tool.env, &origin, index, &name)?;
         let network_requests = NetworkRequests::parse(&tool.network_requests)
             .map_err(|error| tool_error(&origin, index, &name, error))?;
+        // The rejected token itself is never echoed: the fixed detail names the
+        // field and the grammar, and nothing else.
+        let herdr_agent = tool
+            .herdr_agent
+            .map(PaneAgentHint::parse)
+            .transpose()
+            .map_err(|detail| tool_error(&origin, index, &name, detail))?;
 
         tools.push(Tool {
             name,
@@ -5369,6 +5433,7 @@ fn validate_tools(
             interactive_shell: tool.interactive_shell,
             env,
             network_requests,
+            herdr_agent,
             // Already parsed and validated from the verified read, so this is a
             // shared handle, not a second parse. Whole-definition merging needs no
             // special case here: a user winner keeps all of its own fields, and a
@@ -5854,6 +5919,58 @@ pub(crate) fn reference_scope_matches(facts: ReferenceScopeFacts) -> (matches: b
     facts.same_tier && facts.same_file
 }
 
+/// One byte accepted in a pane agent hint: ASCII lowercase, a digit, or `-`.
+///
+/// Deliberately narrower than [`ToolName`]'s alphabet and with no label
+/// allowlist: the value is a herdr label, and a new agent must not need a
+/// launcher release to be labelled. Every non-ASCII byte fails here, so a
+/// Unicode spelling is rejected at its first such byte rather than folded.
+pub open spec fn pane_hint_byte_spec(byte: u8) -> bool {
+    (b'a' <= byte && byte <= b'z') || (b'0' <= byte && byte <= b'9') || byte == b'-'
+}
+
+/// The whole `herdr_agent` decision: accepted iff the bytes are nonempty and
+/// every byte is `[a-z0-9-]`. Case is significant and nothing is trimmed.
+///
+/// This is the parse of untrusted config text before it enters the host's own
+/// environment (ADR-0018), not a sandbox authorization: the launcher's re-exec
+/// reads an already-validated [`PaneAgentHint`].
+// The `<=` spelling (rather than clippy's suggested `(b'a'..=b'z').contains`) is
+// kept so the exec bytes stay syntactically the predicate the `verus!` spec fn
+// unfolds to — the same allow and the same reason as
+// `config_mounts::mount_set_name_bytes`.
+#[allow(clippy::manual_range_contains)]
+pub fn pane_hint_token_bytes(bytes: &[u8]) -> (valid: bool)
+    ensures
+        valid == (bytes@.len() > 0
+            && forall|i: int| 0 <= i < bytes@.len() ==> pane_hint_byte_spec(bytes@[i])),
+{
+    let len = bytes.len();
+    if len == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < len
+        invariant
+            i <= len,
+            len == bytes@.len(),
+            len > 0,
+            forall|j: int| 0 <= j < i ==> pane_hint_byte_spec(bytes@[j]),
+        decreases len - i,
+    {
+        let byte = bytes[i];
+        if !((b'a' <= byte && byte <= b'z')
+            || (b'0' <= byte && byte <= b'9')
+            || byte == b'-')
+        {
+            // `i` is the counterexample: inside the slice and not accepted.
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 } // verus!
 
 /// `true` when linking both `a` and `b` into the guest HOME would make one
@@ -6098,8 +6215,9 @@ fn deserialize_error(file: &Path, text: &str, error: &toml::de::Error) -> anyhow
     };
     anyhow!(
         "config: {}{location}: invalid TOML or tool schema; check syntax and field types. \
-         Required: a string `name` and `command`; `args`, `credentials`, `tools`, `persist`, \
-         `mounts` and `network_requests` are arrays of strings; `env` is a table of string values; \
+         Required: a string `name` and `command`; an optional string `herdr_agent`; \
+         `args`, `credentials`, `tools`, `persist`, `mounts` and `network_requests` are arrays of \
+         strings; `env` is a table of string values; \
          the top-level `image` and each tool's `command` are strings; the top-level \
          `sources`, accepted only in the project tier, is an array of `[[sources]]` tables \
          (or `sources = []`); the top-level \
@@ -8276,16 +8394,18 @@ mod tests {
 
     /// Whole-definition merging never fills an omission in **either** direction: an
     /// authorized project definition replaces the user's whole definition, so the
-    /// user's mount list is not grafted onto it, and the differing fields are
-    /// reported with `mounts` last.
+    /// user's mount list and pane agent hint are not grafted onto it, and the
+    /// differing fields are reported with `mounts` before `herdr_agent`.
     #[test]
     fn whole_definition_merge_never_fills_user_omissions() {
-        // The user tool declares a mount list; the project's same-name definition
-        // declares none but authorizes the verb, so it wins whole — and the user's
-        // mount list is not filled in.
+        // The user tool declares a mount list and a pane hint; the project's
+        // same-name definition declares neither but authorizes the verb, so it
+        // wins whole — and neither of the user's fields is filled in. The pair is
+        // the same shape as `env` below: a hint is a definition field, not an
+        // overlay.
         let f = Fixture::new();
         f.user(&tool(
-            "name = \"t\"\ncommand = \"cmd\"\nmounts = [\"/a:/a:ro\"]\nnetwork_requests = [\"a.example\"]\n",
+            "name = \"t\"\ncommand = \"cmd\"\nmounts = [\"/a:/a:ro\"]\nnetwork_requests = [\"a.example\"]\nherdr_agent = \"user-agent\"\n",
         ));
         f.project(&tool(
             "name = \"t\"\ncommand = \"cmd\"\nnetwork_requests = [\"b.example\"]\n",
@@ -8294,9 +8414,26 @@ mod tests {
         assert_eq!(report.conflicts().len(), 1);
         assert_eq!(
             report.conflicts()[0].fields(),
-            &[ToolField::NetworkRequests, ToolField::Mounts]
+            &[
+                ToolField::NetworkRequests,
+                ToolField::Mounts,
+                ToolField::HerdrAgent
+            ]
         );
         let catalog = report.into_launch_catalog().unwrap();
+        assert_eq!(
+            entry_of(&catalog, "t").tool().herdr_agent(),
+            None,
+            "the bare name's definition declares no hint, and the other's is never grafted on"
+        );
+        assert_eq!(
+            entry_of(&catalog, "home:t")
+                .tool()
+                .herdr_agent()
+                .map(PaneAgentHint::as_str),
+            Some("user-agent"),
+            "the user's own definition keeps its own hint"
+        );
         assert_eq!(
             guest_mounts(&catalog, "t"),
             Vec::<String>::new(),
@@ -8651,6 +8788,12 @@ mod tests {
                 shipped.name()
             );
             assert_eq!(documented.env, shipped.env, "{}", shipped.name());
+            assert_eq!(
+                documented.herdr_agent(),
+                shipped.herdr_agent(),
+                "{}",
+                shipped.name()
+            );
             assert_eq!(
                 documented.network_requests,
                 shipped.network_requests,
@@ -10885,6 +11028,185 @@ mod tests {
         }
     }
 
+    /// A1: `herdr_agent` is legal in every tier, and the hint a launch would read
+    /// is the declared spelling — no trimming, folding or allowlist. The two
+    /// source rows are the ones worth pinning: an out-of-checkout verified read
+    /// (`trust = true`, `allow = false`) and an in-checkout pinned read
+    /// (`trust = false`, `allow = false`) take different read paths to the same
+    /// validator.
+    #[test]
+    fn pane_hint_parses_in_every_tool_tier() {
+        const HINT: &str = "future-agent-9";
+        // `-` is a legal whole hint: the grammar has no "must start with a
+        // letter" clause and no label allowlist, so nothing rejects it.
+        let declarations = format!(
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nherdr_agent = \"{HINT}\"\n\
+             [[tools]]\nname = \"dash\"\ncommand = \"t\"\nherdr_agent = \"-\"\n\
+             [[tools]]\nname = \"plain\"\ncommand = \"t\"\n"
+        );
+        let hints = |tools: Vec<&Tool>| -> Vec<(String, Option<String>)> {
+            tools
+                .iter()
+                .map(|tool| {
+                    (
+                        tool.name().to_owned(),
+                        tool.herdr_agent().map(|hint| hint.as_str().to_owned()),
+                    )
+                })
+                .collect()
+        };
+        let expected = vec![
+            ("t".to_string(), Some(HINT.to_string())),
+            ("dash".to_string(), Some("-".to_string())),
+            ("plain".to_string(), None),
+        ];
+
+        // The shipped tier, through the embedded-catalog read.
+        let shipped = tools_from_builtin_text(&declarations).unwrap();
+        assert_eq!(hints(shipped.iter().collect()), expected);
+
+        // The user tier, whose `t` is reachable as `home:t`.
+        let user = Fixture::new();
+        user.user(&declarations);
+        let report = user.load().unwrap();
+        assert_eq!(hints(report.resolved().launch_tools().collect()), expected);
+        let catalog = report.into_launch_catalog().unwrap();
+        assert_eq!(
+            entry_of(&catalog, "home:t")
+                .tool()
+                .herdr_agent()
+                .map(PaneAgentHint::as_str),
+            Some(HINT)
+        );
+
+        // The project tier, whose `t` wins the bare spelling.
+        let project = Fixture::new();
+        project.project(&declarations);
+        let catalog = project.load().unwrap().into_launch_catalog().unwrap();
+        assert_eq!(
+            entry_of(&catalog, "t")
+                .tool()
+                .herdr_agent()
+                .map(PaneAgentHint::as_str),
+            Some(HINT)
+        );
+
+        // A verified out-of-checkout source: 0600 file, 0700 directory, route
+        // outside the checkout, no pin.
+        let verified = SourcesFixture::new();
+        let path = verified.base().join("team.toml");
+        write_file(&path, &declarations);
+        let catalog = verified
+            .with_project(&source_table("team", &path, true, false))
+            .expect("a verified source loads")
+            .into_launch_catalog()
+            .unwrap();
+        assert_eq!(
+            entry_of(&catalog, "team:t")
+                .tool()
+                .herdr_agent()
+                .map(PaneAgentHint::as_str),
+            Some(HINT)
+        );
+
+        // An in-checkout pinned source: refused until approved, then decoded
+        // through the same validator.
+        let pinned = SourcesFixture::new();
+        let path = pinned.write_repo("team.toml", &declarations);
+        pinned.write_project(&source_table("team", &path, false, false));
+        let error = pinned.load_unapproved().expect_err("the source is pending");
+        assert!(
+            error
+                .downcast_ref::<crate::config_pins::UnapprovedSources>()
+                .is_some(),
+            "the first load is a pin refusal: {error:#}"
+        );
+        let catalog = pinned
+            .load()
+            .expect("the real approval and reload succeed")
+            .into_launch_catalog()
+            .unwrap();
+        assert_eq!(
+            entry_of(&catalog, "team:t")
+                .tool()
+                .herdr_agent()
+                .map(PaneAgentHint::as_str),
+            Some(HINT)
+        );
+    }
+
+    /// A1: the grammar is the whole rule, so every near-miss is refused with the
+    /// tool, the declaration and the field named — and with **no** copy of the
+    /// rejected value. A wrong type is not a token error at all: it stays on the
+    /// generic redacted serde path.
+    ///
+    /// The detail is compared after the `declaration [i] tool "t": ` boundary
+    /// instead of `contains` over the whole message: the prefix carries the
+    /// config file's path, so a `TMPDIR` (or an ancestor) spelling a short
+    /// rejected token such as `Pi` used to make a correct diagnostic "echo" it.
+    /// Whole-message redaction is still asserted, on one high-entropy token no
+    /// path can spell (#762 review M2).
+    #[test]
+    fn pane_hint_rejects_invalid_tokens() {
+        const BOUNDARY: &str = " declaration [0] tool \"t\": ";
+        const DETAIL: &str = "herdr_agent must match [a-z0-9-]+";
+        fn detail_after_boundary<'a>(rendered: &'a str, boundary: &str) -> &'a str {
+            rendered
+                .split_once(boundary)
+                .unwrap_or_else(|| panic!("no {boundary:?} in {rendered}"))
+                .1
+        }
+        for value in [
+            "",         // empty
+            "Pi",       // uppercase
+            "pi ",      // trailing space, not trimmed
+            "p\\ti",    // a TOML-escaped tab
+            "pi=codex", // `=`
+            "pi/cli",   // `/`
+            "pí",       // non-ASCII
+        ] {
+            let fixture = Fixture::new();
+            fixture.user(&format!(
+                "[[tools]]\nname = \"t\"\ncommand = \"t\"\nherdr_agent = \"{value}\"\n"
+            ));
+            let rendered = format!("{:#}", fixture.load().unwrap_err());
+            assert_eq!(
+                detail_after_boundary(&rendered, BOUNDARY),
+                DETAIL,
+                "value={value:?}"
+            );
+        }
+
+        // Whole-diagnostic redaction, on a token long enough that a path cannot
+        // account for a match. The exact detail is asserted too, so a regression
+        // that appends the token to it fails here even if the token stayed short.
+        const CANARY: &str = "pi-canary-9f3a2b7c";
+        let fixture = Fixture::new();
+        fixture.user(&format!(
+            "[[tools]]\nname = \"t\"\ncommand = \"t\"\nherdr_agent = \"{CANARY}!\"\n"
+        ));
+        let rendered = format!("{:#}", fixture.load().unwrap_err());
+        assert!(
+            !rendered.contains(CANARY),
+            "the rejected token was echoed: {rendered}"
+        );
+        assert_eq!(
+            detail_after_boundary(&rendered, BOUNDARY),
+            DETAIL,
+            "{rendered}"
+        );
+
+        // A wrong type is the redacted schema diagnostic, never the token rule.
+        let fixture = Fixture::new();
+        fixture.user("[[tools]]\nname = \"t\"\ncommand = \"t\"\nherdr_agent = 7\n");
+        let rendered = format!("{:#}", fixture.load().unwrap_err());
+        assert!(
+            rendered.contains("invalid TOML or tool schema"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("must match [a-z0-9-]+"), "{rendered}");
+    }
+
     #[test]
     fn invalid_utf8_is_rejected_with_fixed_guidance() {
         let fixture = Fixture::new();
@@ -11224,7 +11546,7 @@ mod tests {
 
     #[test]
     fn each_differing_field_is_reported_individually_in_fixed_order() {
-        let base = "[[tools]]\nname = \"t\"\ncommand = \"cmd\"\nargs = [\"a\"]\ncredentials = [\"openai\"]\ntools = [\"base\"]\npersist = [\"p\"]\ninteractive_shell = false\nenv = { A = \"1\" }\nnetwork_requests = [\"a.example\"]\n";
+        let base = "[[tools]]\nname = \"t\"\ncommand = \"cmd\"\nargs = [\"a\"]\ncredentials = [\"openai\"]\ntools = [\"base\"]\npersist = [\"p\"]\ninteractive_shell = false\nenv = { A = \"1\" }\nnetwork_requests = [\"a.example\"]\nherdr_agent = \"agent-a\"\n";
         let cases = [
             ("command = \"other\"", ToolField::Command),
             ("args = [\"b\"]", ToolField::Args),
@@ -11237,6 +11559,7 @@ mod tests {
                 "network_requests = [\"b.example\"]",
                 ToolField::NetworkRequests,
             ),
+            ("herdr_agent = \"agent-b\"", ToolField::HerdrAgent),
         ];
         for (mutated, expected) in cases {
             let project_body = base.replace(
@@ -11249,6 +11572,7 @@ mod tests {
                     ToolField::InteractiveShell => "interactive_shell = false",
                     ToolField::Env => "env = { A = \"1\" }",
                     ToolField::NetworkRequests => "network_requests = [\"a.example\"]",
+                    ToolField::HerdrAgent => "herdr_agent = \"agent-a\"",
                     // Unreachable in this table: a project tool may not declare
                     // `mounts` at all, so its presence is a load error rather than
                     // a differing-field warning. Named here so the match stays
@@ -11272,7 +11596,8 @@ mod tests {
             .replace(
                 "network_requests = [\"a.example\"]",
                 "network_requests = [\"b.example\"]",
-            );
+            )
+            .replace("herdr_agent = \"agent-a\"", "herdr_agent = \"agent-b\"");
         let fixture = Fixture::new();
         fixture.user(base).project(&project_body);
         let report = fixture.load().unwrap();
@@ -11282,11 +11607,13 @@ mod tests {
             &[
                 ToolField::InteractiveShell,
                 ToolField::Env,
-                ToolField::NetworkRequests
+                ToolField::NetworkRequests,
+                ToolField::HerdrAgent
             ],
-            "network_requests must be reported last"
+            "herdr_agent must be reported last"
         );
         assert_eq!(ToolField::Env.as_str(), "env");
+        assert_eq!(ToolField::HerdrAgent.as_str(), "herdr_agent");
     }
 
     #[test]

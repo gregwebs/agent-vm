@@ -123,7 +123,8 @@ fn main() -> Result<()> {
     // One project capture at process entry feeds both config discovery and every
     // command that consumes both the catalog and a project (ADR-0073 D2), so a
     // cwd rename cannot split catalog identity from pin/launch identity.
-    // One capture per command: handed beside `Dispatch` to `run_dispatch`.
+    // One capture per pass: handed beside that pass's `Dispatch` to
+    // `run_dispatch`. A re-exec below starts a *new* pass with its own capture.
     #[allow(clippy::disallowed_methods)]
     let project = project::ProjectDir::capture();
     // The argv is kept alive across the pin gate: the gate asks the real CLI
@@ -160,6 +161,32 @@ fn main() -> Result<()> {
         Err(error) => return Err(report_dispatch_failure(error, false)),
     };
 
+    // herdr labels a pane from the *exec-time* environment of the process it
+    // sees, and the agent runs behind this launcher. So the label is applied
+    // here, by replacing this image with itself plus `HERDR_AGENT`: same PID,
+    // same terminal, same cwd, and no implicit forwarding into the assembled
+    // guest environment. Both the decision and the effect are host-only and are
+    // gated on the selected tool's **own** hint (never a folded closure): a
+    // launch labels its own pane.
+    //
+    // Placed after the parse, so help, a usage error, a refusal and every
+    // built-in route reach no `execve`; before `record_active`, because a
+    // successful exec discards this pass's unrecorded activations with the rest
+    // of it — the new image records its own from its own load. A failed exec
+    // falls through to exactly the path below.
+    if let Some(hint) = reexec_hint(
+        selected_pane_hint(&dispatch),
+        std::env::var_os("HERDR_ENV").as_deref(),
+        std::env::var_os("HERDR_AGENT").as_deref(),
+    ) {
+        exec_with_pane_hint(
+            hint,
+            std::env::current_exe(),
+            std::env::args_os(),
+            &mut std::io::stderr(),
+        );
+    }
+
     // The status policy of everything below depends on the route, recorded
     // while it is still observable on the dispatch itself.
     let direct = dispatch.is_direct_launch();
@@ -173,6 +200,157 @@ fn main() -> Result<()> {
         eprintln!("{}", pins_cmd::record_active_warning(&error, &active));
     }
     run_dispatch(dispatch, project).map_err(|error| report_dispatch_failure(error, direct))
+}
+
+/// The pane agent hint the selected dispatch would label the host's pane with.
+///
+/// Only a **tool** launch can carry one: a direct command has no catalog entry,
+/// and every built-in route (`doctor`, `config …`, `help`, …) launches nothing.
+/// The bare `shell` affordance is excluded by route — it is a shell, not an
+/// agent, even when a project definition supplies it — so a hint declared on one
+/// is report-only (`doctor` still prints it). A qualified `home:shell` or
+/// `repo:shell` is not the affordance and can opt in with its own hint.
+fn selected_pane_hint(dispatch: &Dispatch) -> Option<&config::PaneAgentHint> {
+    match dispatch {
+        Dispatch::Launch {
+            target: launch_target::LaunchTarget::Tool { entry, .. },
+            ..
+        } if !entry.is_shell_affordance() => entry.tool().herdr_agent(),
+        _ => None,
+    }
+}
+
+/// Whether this pass must re-exec, and with which label. Pure, so the decision
+/// is tested without replacing a process image.
+///
+/// The conjunction is exact: an eligible hint, `HERDR_ENV` exactly `"1"`, and an
+/// **absent** `HERDR_AGENT`. Absence is the whole test for the override, so any
+/// existing value wins — including the empty string a user writes to opt out
+/// (`HERDR_AGENT= agent-vm pi`) — and any other `HERDR_ENV` value means "not
+/// under herdr", leaving the launch untouched. Empty and non-UTF-8 values are
+/// present values: they arrive here as `Some` without being decoded.
+fn reexec_hint<'a>(
+    hint: Option<&'a config::PaneAgentHint>,
+    herdr_env: Option<&std::ffi::OsStr>,
+    herdr_agent: Option<&std::ffi::OsStr>,
+) -> Option<&'a config::PaneAgentHint> {
+    match (hint, herdr_env, herdr_agent) {
+        (Some(hint), Some(env), None) if env == "1" => Some(hint),
+        _ => None,
+    }
+}
+
+/// Replace this process with itself, carrying `HERDR_AGENT=<hint>`.
+///
+/// Best effort: on success this never returns, and on failure it writes one
+/// warning and returns so the original launch continues **without** the label
+/// (A6). A pane herdr cannot list is a degradation, never a failed launch, so
+/// nothing here can propagate, panic, or print argv, an environment value or the
+/// hint.
+///
+/// `libc::execve` rather than [`std::os::unix::process::CommandExt::exec`]: the
+/// standard library resets `SIGPIPE` to its default *before* its exec and leaves
+/// it reset when that exec fails, so an `EPIPE` on the warning below would kill
+/// the launcher with signal 13 instead of continuing. Nothing here changes a
+/// disposition before the call, so a failed `execve` returns its errno into the
+/// launcher's `SIGPIPE` handling exactly as it was found.
+fn exec_with_pane_hint(
+    hint: &config::PaneAgentHint,
+    executable: std::io::Result<std::path::PathBuf>,
+    argv: impl IntoIterator<Item = std::ffi::OsString>,
+    warning: &mut impl std::io::Write,
+) {
+    let error = match try_exec_with_pane_hint(hint, executable, argv) {
+        // `execve` only returns by failing, so the success case is uninhabited.
+        Ok(never) => match never {},
+        Err(error) => error,
+    };
+    // `emit` escapes the line and attempts one `write_all`; its own error —
+    // including `EPIPE`/`EBADF` on the closed stderr of A6 — is ignored.
+    let _ = launch_notice::LaunchNotices::new(warning).emit(format_args!(
+        "agent-vm: warning: herdr will not list this agent: re-exec with HERDR_AGENT failed: \
+         {error}"
+    ));
+}
+
+/// The fallible half of [`exec_with_pane_hint`]: build the two pointer arrays and
+/// call `execve`.
+///
+/// Nothing about the invocation is reconstructed. `argv` is the process's own
+/// `args_os()`, so empty arguments, non-UTF-8 bytes and their order survive, and
+/// `argv[0]` is re-used as given rather than re-derived from the tool's parsed
+/// args. The environment is one `vars_os()` snapshot plus the single added pair,
+/// so no value is re-encoded through Unicode, no host variable is dropped, and
+/// no `=` inside a value is re-split. What this relies on is what a successful
+/// exec keeps: the same PID, cwd, process group and terminal relationship, and
+/// the signal mask.
+fn try_exec_with_pane_hint(
+    hint: &config::PaneAgentHint,
+    executable: std::io::Result<std::path::PathBuf>,
+    argv: impl IntoIterator<Item = std::ffi::OsString>,
+) -> std::io::Result<std::convert::Infallible> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // An absolute pathname, never a PATH or `argv[0]` lookup: a PATH fallback
+    // could re-exec a *different* program. `current_exe` is a pathname and not a
+    // handle to the running image, so this assumes a stable, trusted
+    // installation path — a replacement at that path that starts successfully
+    // cannot be detected, while an OS failure warns and falls back.
+    let path = executable?;
+    let path = c_string(path.as_os_str().as_bytes().to_vec(), "the executable path")?;
+
+    let mut argv_strings = Vec::new();
+    for argument in argv {
+        argv_strings.push(c_string(argument.as_bytes().to_vec(), "an argument")?);
+    }
+    if argv_strings.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "argv[0] is missing",
+        ));
+    }
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv_strings
+        .iter()
+        .map(|argument| argument.as_ptr())
+        .collect();
+    argv_ptrs.push(std::ptr::null());
+
+    let mut env_strings = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        let mut pair = key.as_bytes().to_vec();
+        pair.push(b'=');
+        pair.extend_from_slice(value.as_bytes());
+        env_strings.push(c_string(pair, "an environment entry")?);
+    }
+    // herdr reads the exec-time environment; `setenv` cannot label this process.
+    let mut label = b"HERDR_AGENT=".to_vec();
+    label.extend_from_slice(hint.as_str().as_bytes());
+    env_strings.push(c_string(label, "the pane hint")?);
+    let mut envp_ptrs: Vec<*const libc::c_char> =
+        env_strings.iter().map(|entry| entry.as_ptr()).collect();
+    envp_ptrs.push(std::ptr::null());
+
+    // Safety: both pointer arrays are null-terminated, and every pointer in them
+    // points into a live, NUL-terminated `CString` owned by the vectors above,
+    // which outlive this call. `execve` only reads them, for the duration of the
+    // call, and returns only on failure.
+    unsafe {
+        libc::execve(path.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+    }
+    // Captured immediately: any later call could overwrite the thread's errno.
+    Err(std::io::Error::last_os_error())
+}
+
+/// A `CString` from raw bytes, with a fixed and value-free message on the one
+/// failure `CString` has (an interior NUL). The value is never echoed: it is argv
+/// or environment text.
+fn c_string(bytes: Vec<u8>, what: &'static str) -> std::io::Result<std::ffi::CString> {
+    std::ffi::CString::new(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{what} contains a NUL byte"),
+        )
+    })
 }
 
 /// Report a dispatch failure with its status, ending the process here when the
@@ -2186,5 +2364,593 @@ mod tests {
         );
         // The marker reports the underlying configuration error, not itself.
         assert_eq!(format!("{deferred}"), "broken catalog");
+    }
+
+    // -- #762: the pane agent hint's host-only re-exec -------------------------
+
+    /// A4: the decision is exactly eligible hint + `HERDR_ENV=1` + **absent**
+    /// `HERDR_AGENT`. Absence is the whole override test, so an existing value —
+    /// including the empty one a user writes to opt out — wins; and `HERDR_ENV`
+    /// must be exactly `1`, because anything else means "not under herdr".
+    #[test]
+    fn reexec_hint_requires_exact_opt_in_and_absent_override() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        // The validated hint comes from the shipped catalog's own accessors, not
+        // from `default_tools()` or a second `parse`.
+        let mut catalog = config::default_launch_catalog().unwrap();
+        let pi = catalog.take_entry("pi").expect("`pi` is a shipped verb");
+        let hint = pi.tool().herdr_agent().expect("shipped `pi` declares one");
+        assert_eq!(hint.as_str(), "pi");
+
+        let one = std::ffi::OsStr::new("1");
+        let other = std::ffi::OsStr::new("claude");
+        let empty = std::ffi::OsStr::new("");
+        let non_utf8 = std::ffi::OsStr::from_bytes(b"\xff-agent");
+        let non_utf8_one = std::ffi::OsStr::from_bytes(b"1\xff");
+
+        assert_eq!(reexec_hint(Some(hint), Some(one), None), Some(hint));
+        for agent in [other, empty, non_utf8, std::ffi::OsStr::new("pi")] {
+            assert_eq!(
+                reexec_hint(Some(hint), Some(one), Some(agent)),
+                None,
+                "an existing HERDR_AGENT wins, even empty or pass two: {agent:?}"
+            );
+        }
+        for herdr_env in [
+            None,
+            Some(empty),
+            Some(std::ffi::OsStr::new("0")),
+            Some(std::ffi::OsStr::new("true")),
+            Some(non_utf8_one),
+        ] {
+            assert_eq!(
+                reexec_hint(Some(hint), herdr_env, None),
+                None,
+                "the opt-in is exactly `1`: {herdr_env:?}"
+            );
+        }
+        assert_eq!(
+            reexec_hint(None, Some(one), None),
+            None,
+            "no hint, no re-exec"
+        );
+    }
+
+    /// A4/A5: the re-exec reads **only** the selected tool's own hint, and a bare
+    /// `shell` never re-execs. Everything here goes through the real CLI parse and
+    /// the real catalog, so the selection is the one production makes.
+    #[test]
+    fn pane_hint_uses_only_the_selected_tool_dispatch() {
+        use crate::credential_provider::CredentialProvider;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+
+        // A reload per argv: the catalog a verb dispatches from is the load's.
+        let dispatch_of = |paths: &config::ConfigPaths, argv: &[&str]| -> Dispatch {
+            let config = config::load(paths);
+            let argv: Vec<std::ffi::OsString> = argv.iter().map(std::ffi::OsString::from).collect();
+            cli::parse_from(argv, config).expect("the argv dispatches")
+        };
+        // Pass one's decision inputs, supplied explicitly.
+        let hint_of = |dispatch: &Dispatch| -> Option<String> {
+            reexec_hint(
+                selected_pane_hint(dispatch),
+                Some(std::ffi::OsStr::new("1")),
+                None,
+            )
+            .map(|hint| hint.as_str().to_owned())
+        };
+
+        // The shipped catalog: one tool hint, no hint on any other route.
+        let empty = tempfile::tempdir().unwrap();
+        let shipped = config::ConfigPaths::for_test(
+            Some(empty.path().join("no-user.toml")),
+            empty.path().join("no-project.toml"),
+        );
+        for (argv, expected) in [
+            (vec!["agent-vm", "pi"], Some("pi".to_string())),
+            (vec!["agent-vm", "run", "pi"], None),
+            (vec!["agent-vm", "--", "pi"], None),
+            (vec!["agent-vm", "shell"], None),
+            (vec!["agent-vm", "doctor"], None),
+        ] {
+            assert_eq!(hint_of(&dispatch_of(&shipped, &argv)), expected, "{argv:?}");
+        }
+
+        // A real verified user file (0600 in a 0700 directory, the read
+        // `default_tools` requires) whose `helper` only *provisions* `pi`.
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("config.toml");
+        let project = dir.path().join("no-project.toml");
+        let write_user = |body: &str| {
+            std::fs::write(&user, body).unwrap();
+            std::fs::set_permissions(&user, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        write_user(
+            "default_tools = [\"pi\"]\n\
+             [[tools]]\nname = \"pi\"\ncommand = \"pi\"\ncredentials = [\"openai\"]\n\
+             herdr_agent = \"pi\"\n\
+             [[tools]]\nname = \"helper\"\ncommand = \"/bin/echo\"\ntools = [\"pi\"]\n",
+        );
+        let paths = config::ConfigPaths::for_test(Some(user.clone()), project.clone());
+        assert_eq!(
+            hint_of(&dispatch_of(&paths, &["agent-vm", "pi"])),
+            Some("pi".to_string())
+        );
+
+        // Provisioning is not selection: `helper` inherits `pi`'s provider and
+        // still re-execs with nothing.
+        let helper = dispatch_of(&paths, &["agent-vm", "helper"]);
+        match &helper {
+            Dispatch::Launch {
+                target: launch_target::LaunchTarget::Tool { entry, .. },
+                ..
+            } => {
+                assert!(
+                    entry.provisioned().contains(CredentialProvider::OpenAi),
+                    "`helper` provisions `pi`'s provider"
+                );
+                assert_eq!(entry.tool().herdr_agent(), None, "`helper` declares none");
+            }
+            _ => panic!("`helper` is a tool launch"),
+        }
+        assert_eq!(hint_of(&helper), None);
+
+        // Both direct spellings carry the authored `default_tools` grant and no
+        // hint: a direct command has no declaration of its own to read.
+        for argv in [vec!["agent-vm", "run", "pi"], vec!["agent-vm", "--", "pi"]] {
+            let dispatch = dispatch_of(&paths, &argv);
+            match &dispatch {
+                Dispatch::Launch {
+                    target: launch_target::LaunchTarget::Direct { grant, .. },
+                    ..
+                } => assert!(
+                    grant.provisioned().contains(CredentialProvider::OpenAi),
+                    "{argv:?} carries the authored default grant"
+                ),
+                _ => panic!("{argv:?} is a direct launch"),
+            }
+            assert_eq!(hint_of(&dispatch), None, "{argv:?}");
+        }
+
+        // The shell affordance receives the same grant and still no hint: it is
+        // the shipped fallback here, which declares none.
+        let shell = dispatch_of(&paths, &["agent-vm", "shell"]);
+        match &shell {
+            Dispatch::Launch {
+                target: launch_target::LaunchTarget::Tool { entry, .. },
+                ..
+            } => {
+                assert!(entry.is_shell_affordance(), "the bare `shell` verb");
+                assert!(
+                    entry.provisioned().contains(CredentialProvider::OpenAi),
+                    "the affordance carries the effective closure"
+                );
+                assert_eq!(entry.tool().herdr_agent(), None);
+            }
+            _ => panic!("`shell` is a tool launch"),
+        }
+        assert_eq!(hint_of(&shell), None);
+
+        // A project `shell` owns the bare route, so its own hint is selected —
+        // and is still report-only, while the user's qualified `home:shell` can
+        // opt in with its own.
+        write_user(
+            "default_tools = [\"pi\"]\n\
+             [[tools]]\nname = \"pi\"\ncommand = \"pi\"\ncredentials = [\"openai\"]\n\
+             herdr_agent = \"pi\"\n\
+             [[tools]]\nname = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n\
+             herdr_agent = \"user-shell-hint\"\n",
+        );
+        std::fs::write(
+            &project,
+            "[[tools]]\nname = \"shell\"\ncommand = \"bash\"\ninteractive_shell = true\n\
+             herdr_agent = \"project-shell-hint\"\n",
+        )
+        .unwrap();
+        let shell = dispatch_of(&paths, &["agent-vm", "shell"]);
+        match &shell {
+            Dispatch::Launch {
+                target: launch_target::LaunchTarget::Tool { entry, .. },
+                ..
+            } => {
+                assert!(
+                    entry.is_shell_affordance(),
+                    "the project's `shell` wins the route"
+                );
+                assert_eq!(
+                    entry
+                        .tool()
+                        .herdr_agent()
+                        .map(config::PaneAgentHint::as_str),
+                    Some("project-shell-hint"),
+                    "the selected definition's own hint"
+                );
+            }
+            _ => panic!("`shell` is a tool launch"),
+        }
+        assert_eq!(hint_of(&shell), None, "a bare `shell` never re-execs");
+        assert_eq!(
+            hint_of(&dispatch_of(&paths, &["agent-vm", "home:shell"])),
+            Some("user-shell-hint".to_string()),
+            "a qualified `shell` opts in with its own hint"
+        );
+    }
+
+    /// A terminal that answers from a fixed list and counts its reads, so "no
+    /// second question" is observed rather than assumed.
+    struct PaneHintTerminal {
+        answers: std::collections::VecDeque<crate::config_pins::prompt::Answer>,
+        reads: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl PaneHintTerminal {
+        fn answering(answers: &[crate::config_pins::prompt::Answer]) -> Self {
+            Self {
+                answers: answers.iter().copied().collect(),
+                reads: std::rc::Rc::new(std::cell::Cell::new(0)),
+            }
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.get()
+        }
+    }
+
+    impl crate::config_pins::prompt::ApprovalTerminal for PaneHintTerminal {
+        fn verify_foreground(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn discard_pending_input(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn read_answer(&mut self) -> std::io::Result<crate::config_pins::prompt::Answer> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(self
+                .answers
+                .pop_front()
+                .unwrap_or(crate::config_pins::prompt::Answer::NoAnswer))
+        }
+    }
+
+    /// A4's unchanged-input guarantee, end to end: two passes over the same
+    /// pin-approved source prompt **once**. Pass one is a real load, the real
+    /// route preflight, the real gate (with a terminal that approves once) and
+    /// the real parse; the image boundary is simulated by dropping that dispatch
+    /// and rebuilding the capture and paths over unchanged files.
+    ///
+    /// Pass two must therefore load, not prompt, record nothing, select the same
+    /// hint, and not re-exec. Its terminal is eligible and has no answers left, so
+    /// a repeated question would fail rather than pass unnoticed.
+    #[test]
+    fn pane_hint_two_pass_unchanged_source_does_not_reprompt() {
+        use crate::config_pins::prompt::Answer;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut env = crate::test_env::guard();
+        for name in ["AGENT_VM_MEMORY_GIB", "AGENT_VM_CPUS", "AGENT_VM_IMAGE_TAG"] {
+            env.remove_var(name);
+        }
+
+        // A captured host-managed store, a checkout and a `$HOME` under one
+        // canonical base: the pin routes are real observations.
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let checkout = base.join("checkout");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        let project = crate::project::ProjectDir::from_path_for_tests(&checkout).unwrap();
+        let project_config = crate::project_config::path(&home, &project);
+        let store = project_config.parent().unwrap();
+        std::fs::create_dir_all(store).unwrap();
+        std::fs::set_permissions(store, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            &project_config,
+            "[[sources]]\nname = \"repo\"\npath = \"./team.toml\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            checkout.join("team.toml"),
+            "[[tools]]\nname = \"pi\"\ncommand = \"pi\"\nherdr_agent = \"pi\"\n",
+        )
+        .unwrap();
+        let paths = config::ConfigPaths::for_test_captured(home.clone(), &project);
+        let argv: Vec<std::ffi::OsString> = ["agent-vm", "pi"]
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+
+        // ---- pass one: the pending source, one approval, one exec decision.
+        let config = config::load(&paths);
+        let route = cli::preflight_unapproved_route(&argv, pins_cmd::verb_candidates(&config));
+        assert_eq!(route, Some(cli::LaunchRoute::Verb));
+        let mut terminal = PaneHintTerminal::answering(&[Answer::Approve]);
+        let mut transcript = Vec::new();
+        let config = pins_cmd::gate_with(
+            config,
+            route,
+            Some(&paths),
+            Some(&mut terminal),
+            &mut transcript,
+            1_000,
+        );
+        assert_eq!(terminal.reads(), 1, "one question on pass one");
+        let report = config.expect("the approved reload continues the launch");
+        let pin = report.sources().entries()[0]
+            .pin()
+            .expect("the approval committed a pin");
+        assert!(pin.active(), "the approval is the active baseline");
+        // Derived before the parse consumes the report, exactly as `main` does.
+        // The commit made the digest active, so this pass has nothing left to
+        // record: pass two's `None` below rests on that, not on luck.
+        let active = pins_cmd::ActiveUpdates::of(&report);
+        assert!(
+            active.is_none(),
+            "the approval is already the active baseline"
+        );
+        let dispatch = cli::parse_from(argv.clone(), Ok(report)).expect("`pi` dispatches");
+        assert_eq!(
+            reexec_hint(
+                selected_pane_hint(&dispatch),
+                Some(std::ffi::OsStr::new("1")),
+                None,
+            )
+            .map(|hint| hint.as_str().to_owned()),
+            Some("pi".to_string()),
+            "pass one selects the source's own hint"
+        );
+        drop(dispatch);
+        drop(active);
+
+        // ---- pass two: a new image over the same bytes.
+        let project = crate::project::ProjectDir::from_path_for_tests(&checkout).unwrap();
+        let paths = config::ConfigPaths::for_test_captured(home.clone(), &project);
+        let config = config::load(&paths).expect("unchanged approved bytes load");
+        assert!(
+            pins_cmd::ActiveUpdates::of(&config).is_none(),
+            "the pin committed on pass one is already active"
+        );
+        // The route preflight of a load that succeeded: `pins_cmd::verb_candidates`
+        // returns exactly this for `Ok(report)` — no pending source can change the
+        // catalog, so every bare verb is a candidate.
+        let route = cli::preflight_unapproved_route(&argv, cli::VerbCandidates::AnyPendingSource);
+        assert_eq!(
+            route,
+            Some(cli::LaunchRoute::Verb),
+            "pass two is still a launch route"
+        );
+        let mut terminal = PaneHintTerminal::answering(&[]);
+        let mut transcript = Vec::new();
+        let config = pins_cmd::gate_with(
+            Ok(config),
+            route,
+            Some(&paths),
+            Some(&mut terminal),
+            &mut transcript,
+            2_000,
+        )
+        .expect("nothing is left to approve");
+        assert_eq!(terminal.reads(), 0, "no second question");
+        assert!(transcript.is_empty(), "no second review");
+        assert!(pins_cmd::ActiveUpdates::of(&config).is_none());
+        let dispatch = cli::parse_from(argv.clone(), Ok(config)).expect("`pi` dispatches");
+        assert_eq!(
+            reexec_hint(
+                selected_pane_hint(&dispatch),
+                Some(std::ffi::OsStr::new("1")),
+                None,
+            )
+            .map(|hint| hint.as_str().to_owned()),
+            Some("pi".to_string()),
+            "pass two preserves the selection"
+        );
+        assert_eq!(
+            reexec_hint(
+                selected_pane_hint(&dispatch),
+                Some(std::ffi::OsStr::new("1")),
+                Some(std::ffi::OsStr::new("pi")),
+            ),
+            None,
+            "pass two has HERDR_AGENT, so it cannot exec again"
+        );
+    }
+
+    /// A6: the re-exec is best effort. Every failure shape — a lookup error, a
+    /// real `execve` errno, a missing `argv[0]` — writes **one** escaped line
+    /// naming the fixed prefix and its error, echoes no argv value, and then
+    /// returns so the original launch continues. A sink that fails must not
+    /// panic either (that is not a SIGPIPE test; see
+    /// [`Self::pane_hint_exec_failure_with_closed_stderr_continues`]).
+    #[test]
+    fn pane_hint_exec_failure_warns_once_and_returns() {
+        const PREFIX: &str = "agent-vm: warning: herdr will not list this agent: \
+                             re-exec with HERDR_AGENT failed: ";
+        const SENTINEL: &str = "AVM_ARGV_SENTINEL_762";
+
+        let mut catalog = config::default_launch_catalog().unwrap();
+        let pi = catalog.take_entry("pi").expect("`pi` is a shipped verb");
+        let hint = pi.tool().herdr_agent().expect("shipped `pi` declares one");
+
+        let dir = tempfile::tempdir().unwrap();
+        // An absolute path below a fresh tempdir: no component of it can exist, so
+        // `execve` itself answers `ENOENT`.
+        let missing = dir.path().join("no-such-agent-vm");
+
+        let mut out = Vec::new();
+        exec_with_pane_hint(
+            hint,
+            Ok(missing.clone()),
+            [
+                std::ffi::OsString::from("agent-vm"),
+                std::ffi::OsString::from(SENTINEL),
+            ],
+            &mut out,
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with(PREFIX), "{text}");
+        assert_eq!(
+            text.matches('\n').count(),
+            1,
+            "one line, one newline: {text}"
+        );
+        assert!(
+            text.contains("No such file or directory") || text.contains("os error 2"),
+            "the real errno is reported: {text}"
+        );
+        assert!(!text.contains(SENTINEL), "argv is never echoed: {text}");
+        assert!(!text.contains("=pi"), "the hint is never echoed: {text}");
+
+        // A lookup failure that never reached `execve`.
+        let mut out = Vec::new();
+        exec_with_pane_hint(
+            hint,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "current_exe failed",
+            )),
+            [std::ffi::OsString::from("agent-vm")],
+            &mut out,
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with(PREFIX), "{text}");
+        assert!(text.contains("current_exe failed"), "{text}");
+        assert_eq!(text.matches('\n').count(), 1, "{text}");
+
+        // No `argv[0]`: a fixed, value-free `InvalidInput`.
+        let mut out = Vec::new();
+        exec_with_pane_hint(
+            hint,
+            Ok(missing),
+            std::iter::empty::<std::ffi::OsString>(),
+            &mut out,
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with(PREFIX), "{text}");
+        assert!(text.contains("argv[0] is missing"), "{text}");
+
+        // A sink that refuses every byte: the warning is lost, the control
+        // returns, and nothing panics.
+        struct Failing;
+        impl std::io::Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        exec_with_pane_hint(
+            hint,
+            Ok(dir.path().join("no-such-agent-vm")),
+            [std::ffi::OsString::from("agent-vm")],
+            &mut Failing,
+        );
+    }
+
+    /// The closed-stderr child's selector value: the executable path it must fail
+    /// to exec. Scoped to this one spawn, so ordinary discovery runs the child as
+    /// an immediate pass.
+    const PANE_HINT_CLOSED_STDERR: &str = "AGENT_VM_PANE_HINT_CLOSED_STDERR";
+    const PANE_HINT_CLOSED_STDERR_CHILD: &str = "tests::pane_hint_closed_stderr_child";
+    const PANE_HINT_CONTINUED: &str = "agent-vm-pane-hint: continued past the failed re-exec";
+
+    /// The child: the **production** adapter against `io::stderr()`, whose fd 2 is
+    /// a pipe with no reader. Its only job is to return.
+    #[test]
+    fn pane_hint_closed_stderr_child() {
+        let Ok(missing) = std::env::var(PANE_HINT_CLOSED_STDERR) else {
+            return;
+        };
+        let mut catalog = config::default_launch_catalog().unwrap();
+        let pi = catalog.take_entry("pi").expect("`pi` is a shipped verb");
+        let hint = pi.tool().herdr_agent().expect("shipped `pi` declares one");
+        exec_with_pane_hint(
+            hint,
+            Ok(std::path::PathBuf::from(missing)),
+            [
+                std::ffi::OsString::from("agent-vm"),
+                std::ffi::OsString::from("pi"),
+            ],
+            &mut std::io::stderr(),
+        );
+        // The child runs with `--nocapture`, so this reaches the real fd 1.
+        use std::io::Write as _;
+        let mut stdout = std::io::stdout();
+        stdout
+            .write_all(format!("{PANE_HINT_CONTINUED}\n").as_bytes())
+            .expect("the marker reaches stdout");
+        stdout.flush().expect("the marker is flushed");
+    }
+
+    /// A6 with a **closed** stderr, which is the shape that once killed the
+    /// launcher: a real pipe whose only reader is dropped before the spawn, so the
+    /// child's every write to fd 2 is `EPIPE`.
+    ///
+    /// The child must reach its continuation marker and exit **successfully** —
+    /// not with signal 13. That is what pins `libc::execve` over
+    /// `CommandExt::exec`, which resets `SIGPIPE` to its default before exec and
+    /// leaves it reset when exec fails.
+    #[test]
+    fn pane_hint_exec_failure_with_closed_stderr_continues() {
+        let (reader, writer) = std::io::pipe().expect("a real pipe");
+        // The only reader goes before the spawn: fd 2 in the child is writable by
+        // descriptor but can never be read.
+        drop(reader);
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-agent-vm");
+
+        let mut command =
+            std::process::Command::new(std::env::current_exe().expect("the test binary"));
+        command
+            .args([
+                "--exact",
+                PANE_HINT_CLOSED_STDERR_CHILD,
+                "--test-threads=1",
+                // No capture buffer, so the child's marker reaches fd 1 rather
+                // than libtest's per-test sink.
+                "--nocapture",
+            ])
+            .env(PANE_HINT_CLOSED_STDERR, &missing)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::from(writer));
+        let mut child = ChildGuard::new(command.spawn().expect("spawn the child"));
+        // Dropping `Command` releases the parent's copy of the pipe's write end.
+        drop(command);
+
+        let mut child_stdout = child.get().stdout.take().expect("child stdout");
+        let reader = std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut sink = String::new();
+            let _ = child_stdout.read_to_string(&mut sink);
+            sink
+        });
+        // A timeout is failure: a hang here means the child never returned from
+        // the adapter.
+        let status = child.wait_within(std::time::Duration::from_secs(60));
+        let stdout = reader.join().expect("the stdout reader");
+        assert!(
+            stdout.contains(PANE_HINT_CONTINUED),
+            "the child must continue past the failed re-exec: {stdout}"
+        );
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "an unusable stderr must not abort the launcher: {status}"
+        );
+        assert!(
+            !status.to_string().contains("signal"),
+            "a signal death is the `CommandExt::exec` failure mode: {status}"
+        );
     }
 }

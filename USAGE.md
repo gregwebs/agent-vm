@@ -105,6 +105,42 @@ config files you get the seven shipped defaults `dsh`, `pi`, `codex`, `opencode`
 `agent-vm --help` and `agent-vm doctor` always show the same list, in the same
 order.
 
+### Running under herdr
+
+[herdr](https://herdr.dev/tui/docs/agents/) shows a terminal sprite for the
+agent it detects in each pane. It sees this launcher, not the guest agent behind
+it, so a shipped tool declares a **pane agent hint** (`herdr_agent`) and
+`agent-vm` labels itself with it: when `HERDR_ENV=1` and `HERDR_AGENT` is
+absent, a launch of an eligible tool replaces itself with the same PID plus
+`HERDR_AGENT=<hint>`. The five shipped agents are labelled automatically — `pi`,
+`claude`, `codex`, `opencode`, `copilot` — while `dsh` and `shell` declare none.
+A replacement catalog labels only what it declares.
+
+- **Opt out** with `HERDR_AGENT= agent-vm pi` (an empty value counts as present,
+  so nothing is relabelled and no sidebar entry appears).
+- **Override** for one command: `HERDR_AGENT=pi agent-vm run pi`.
+- **No automatic hint** for `run`, the top-level `--`, or a bare `shell`. `run`
+  and `--` name no catalog declaration; a bare `shell` is excluded by route even
+  when a project declaration supplies it, so a hint on one is report-only
+  (`doctor` prints it). Provisioning `pi` from another tool's `tools` list is not
+  selection either. A `home:shell`/`repo:shell` is not the bare affordance and
+  can opt in with its own hint.
+- **State is screen-detected only.** The label names the agent; the state herdr
+  shows comes from the guest's screen. Metadata and session relay are
+  [#761](https://github.com/gregwebs/agent-vm/issues/761).
+- **Pi with an editor-replacing extension** (for example
+  `@burneikis/pi-vim`) can hide the composer line herdr looks for. Pi is still
+  recognized, but it stays `idle` while working, because no screen rule matches
+  and herdr applies its known-agent idle fallback; see
+  [herdr#6248](https://github.com/herdrdev/herdr/issues/6248) for the fix or
+  workaround. To work around it, copy the **active** Pi manifest in full to
+  `~/.config/herdr/agent-detection/pi.toml`, keep its other rules, and add
+  `{ line_regex = ['^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working$'] }` to the `any` list of each
+  of its two `working` rules, keeping their existing matchers; then run
+  `herdr server reload-agent-manifests` (see
+  [detection manifests](https://herdr.dev/tui/docs/agents/#detection-manifests)).
+  Check which manifest is active with `herdr server agent-manifests --json`.
+
 ### Changed in 0.8.6: `allow_tools` is gone, and the declaration is the verb
 
 **1. `allow_tools` is retired.** Every `[[tools]]` declaration launches itself,
@@ -2562,8 +2598,9 @@ explicit --mount
 #### Complete copyable catalog
 
 The block below is a **full replacement** catalog: it keeps every shipped tool,
-command, argv, credential, environment, persistence and shell setting, and adds
-one `[mount_sets]` entry plus the per-tool selections. Create the referenced
+command, argv, credential, environment, persistence, pane hint and shell
+setting, and adds one `[mount_sets]` entry plus the per-tool selections. Create
+the referenced
 paths (`~/.agents`, `~/.config/github-app`, `~/.pi`) or delete the leaves you do
 not want — do **not** copy real secrets into a fixture to make an example
 launch. A read-only mount of a credential directory is *disclosure* to the
@@ -2595,6 +2632,7 @@ mounts = ["agent"]
 [[tools]]
 name = "pi"
 network_requests = ["api.anthropic.com", "auth.openai.com", "chatgpt.com", "cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com", "daily-cloudcode-pa.sandbox.googleapis.com", "mcp-proxy.anthropic.com", "oauth2.googleapis.com", "pi.dev", "platform.claude.com"]
+herdr_agent = "pi"
 command = "pi"
 args = []
 tools = ["claude", "codex"]
@@ -2605,6 +2643,7 @@ mounts = ["agent", "~/.pi:fork"]
 [[tools]]
 name = "codex"
 network_requests = ["api.openai.com", "auth.openai.com", "chatgpt.com"]
+herdr_agent = "codex"
 command = "codex"
 args = []
 credentials = ["openai"]
@@ -2615,6 +2654,7 @@ mounts = ["agent"]
 [[tools]]
 name = "opencode"
 network_requests = ["api.openai.com", "auth.openai.com", "chatgpt.com", "models.opencode.ai"]
+herdr_agent = "opencode"
 command = "opencode"
 args = []
 credentials = ["openai", "opencode-static"]
@@ -2624,6 +2664,7 @@ mounts = ["agent"]
 [[tools]]
 name = "claude"
 network_requests = ["api.anthropic.com", "mcp-proxy.anthropic.com", "platform.claude.com"]
+herdr_agent = "claude"
 command = "claude"
 args = ["--dangerously-skip-permissions"]
 credentials = ["anthropic"]
@@ -2632,6 +2673,7 @@ mounts = ["agent"]
 
 [[tools]]
 name = "copilot"
+herdr_agent = "copilot"
 command = "copilot"
 args = ["--allow-all-tools"]
 credentials = ["copilot"]
@@ -3338,6 +3380,7 @@ persist = [".cache/mytool"]          # optional; guest-HOME-relative, kept under
 env = { VAR = "value" }              # optional; guest env pairs for this tool
 interactive_shell = false            # optional; join tool arguments into `-c`
 network_requests = ["api.example.com"] # optional; granted on launch with this tool's closure
+herdr_agent = "mytool"               # optional; herdr pane label for a launch of this tool
 ```
 
 - `image` — optional top-level; an OCI image reference selecting the **boot
@@ -3468,6 +3511,17 @@ network_requests = ["api.example.com"] # optional; granted on launch with this t
   closure and it is live on the launch of the tool that declares it. Launches and
   `doctor` print these values (`doctor` lists up to 8): public metadata must not
   contain secrets.
+
+- `herdr_agent` — optional string, any tier. The agent kind
+  [herdr](https://herdr.dev/tui/docs/agents/) labels this launch's pane with.
+  Must match `[a-z0-9-]+`: ASCII lowercase letters, digits and hyphens, at
+  least one character, with no trimming or case folding. There is no list of
+  known labels, so a new agent needs no launcher release; the running herdr must
+  still have a known-agent manifest matching the token, or the pane stays
+  unlabelled. It is **public** metadata that `doctor` prints, it labels the
+  host's view of the launch and never reaches the guest, and only the
+  **selected** tool's own hint is used — it is not inherited through `tools` or
+  `default_tools`. See [Running under herdr](#running-under-herdr).
 
 Unknown keys, wrong types, malformed TOML, unknown
 provider names, duplicate tool names within one file, and **overlapping**
